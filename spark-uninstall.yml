@@ -1,0 +1,99 @@
+---
+- hosts: spark_master:spark_slaves
+  become: True
+  # need the facts because of the services check (var ansible_service_mgr)
+  gather_facts: True
+  vars:
+    pause: 1
+    spark_clean_log4j_xml: True
+    spark_clean_services: True
+    spark_history_service_enabled: "{{ inventory_hostname in groups.spark_master }}"
+    spark_mesos_shuffle_service_enabled: "{{ inventory_hostname in groups.spark_slaves }}"
+    # the run_dir is defined through the role var 'spark_run_dir'
+    run_dir: "{{ spark_run_dir | default('/run/spark') }}"
+    # Note: the new spark role  uses the more standard /etc/systemd/system
+    #systemd_base_dir: /etc/systemd/system
+    # but the old spark services roles wrote the systemd unit files to /lib/systemd/system
+    systemd_base_dir: /lib/systemd/system
+
+  tasks:
+    - name: clean old log4j.xml replaced by log4j.properties
+      file:
+        name: "{{ spark_conf_dir_orig }}/log4j.xml"
+        state: absent
+      when: spark_clean_log4j_xml
+
+    # services on the spark-master
+    - block:
+        - name: stop/disable {{ item }}
+          service:
+            name: "{{ item }}"
+            state: stopped
+            enabled: no
+          with_items:
+           - spark-history
+        - pause: seconds={{pause}} prompt="next step?"
+        - name: clean any remaining spark service PID files in {{ spark_run_dir }}
+          file:
+            name: "{{ run_dir }}/{{ item }}"
+            state: absent
+          with_items:
+            - spark-spark-org.apache.spark.deploy.history.HistoryServer-1.pid
+            - spark--org.apache.spark.deploy.history.HistoryServer-1.pid
+      when:
+        - spark_clean_services
+        - spark_history_service_enabled
+      tags: ["spark-services"]
+
+    # services on the spark-slave
+    - block:
+        - name: stop/disable {{ item }}
+          service:
+            name: "{{ item }}"
+            state: stopped
+            enabled: no
+          with_items:
+           - spark-mesos-shuffle-service
+        - pause: seconds={{pause}} prompt="next step?"
+
+        - name: clean any remaining spark service PID files in {{ spark_run_dir }}
+          file:
+            name: "{{ run_dir }}/{{ item }}"
+            state: absent
+          with_items:
+            - spark-spark-org.apache.spark.deploy.mesos.MesosExternalShuffleService-1.pid
+            - spark--org.apache.spark.deploy.mesos.MesosExternalShuffleService-1.pid
+
+        - name: Check if the MesosExternalShuffleService is still running
+          shell: "ps -ef | grep org.apache.spark.deploy.mesos.MesosExternalShuffleService | grep java | wc -l"
+          check_mode: no
+          register: shuffle_service_check
+          tags: ["check"]
+          # 'wc -l' returns '1' if no shuffle service was found, else '2'
+          changed_when: '"2" in shuffle_service_check.stdout'
+
+        - name: If the MesosExternalShuffleService is still running kill it
+          shell: "pkill -f org.apache.spark.deploy.mesos.MesosExternalShuffleService"
+          when: '"2" in shuffle_service_check.stdout'
+          register: shuffle_service_pkill
+          # It seems on a successfull kill pkill returns rc: -15
+          failed_when: shuffle_service_pkill.rc not in [0,-15]
+      # block scope
+      when:
+        - spark_clean_services
+        - spark_mesos_shuffle_service_enabled
+      tags: ["spark-services"]
+
+    - pause: seconds={{pause}} prompt="next step?"
+
+    - name: clean up old systemd service config files
+      file:
+        name: "{{ systemd_base_dir }}/{{ item }}.service"
+        state: absent
+      with_items:
+       - spark-history
+       - spark-mesos-shuffle-service
+      when:
+        - spark_clean_services
+        - (ansible_service_mgr == "systemd")
+      tags: ["spark-services"]
